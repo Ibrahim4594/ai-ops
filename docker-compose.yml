@@ -24,5 +24,25 @@ services:
     depends_on:
       - otel-lgtm
 
+  incident-api:
+    build:
+      context: ./apps/incident-api
+      dockerfile: Dockerfile
+    container_name: aiops-incident-api
+    ports:
+      - "8001:8001"
+    environment:
+      OTEL_SERVICE_NAME: aiops-incident-api
+      OTEL_RESOURCE_ATTRIBUTES: service.version=0.1.0,deployment.environment=local
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-lgtm:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      INCIDENT_DB_PATH: /data/incidents.db
+      INCIDENT_ARTIFACT_DIR: /data/artifacts
+    volumes:
+      - incident-data:/data
+    depends_on:
+      - otel-lgtm
+
 volumes:
   otel-lgtm-data:
+  incident-data:

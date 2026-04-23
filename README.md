@@ -23,6 +23,9 @@ Wait until `otel-lgtm` has finished starting (first boot can take a short while)
 |-----|---------|
 | http://localhost:8000/healthz | Liveness JSON |
 | http://localhost:8000/work | Nested span, counter metric, log line |
+| http://localhost:8001/v1/alerts | Phase 2 intake endpoint (create/find pending incident) |
+| http://localhost:8001/v1/incidents/{incidentId} | Phase 2 fetch incident state |
+| http://localhost:8001/v1/incidents/{incidentId}/decision | Phase 2 human approve/reject endpoint |
 | http://localhost:3000 | Grafana (default `admin` / `admin`) |
 | OTLP gRPC / HTTP on host | `4317` / `4318` |
 
@@ -38,6 +41,27 @@ Wait until `otel-lgtm` has finished starting (first boot can take a short while)
 - `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`
 - `OTEL_SERVICE_NAME=aiops-sample-service`
 - `OTEL_RESOURCE_ATTRIBUTES=service.version=0.1.0,deployment.environment=local`
+
+## Phase 2 incident-api quick flow
+
+`incident-api` runs at `http://localhost:8001` and persists local state on the named volume `incident-data` mounted to `/data` in the container:
+
+- SQLite DB: `/data/incidents.db`
+- Evidence artifacts: `/data/artifacts`
+
+Simple alert -> fetch -> decision flow:
+
+```bash
+curl -s -X POST http://localhost:8001/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{"source":"alertmanager","fingerprint":"demo-alert-1","status":"firing","startsAt":"2026-04-23T12:00:00Z","labels":{"alertname":"HighCPU","service":"aiops-sample-service","severity":"warning"},"annotations":{"summary":"CPU high"}}'
+
+curl -s http://localhost:8001/v1/incidents/<incident_id>
+
+curl -s -X POST http://localhost:8001/v1/incidents/<incident_id>/decision \
+  -H "Content-Type: application/json" \
+  -d '{"decision":"approve","actor":"human@local","reason":"confirmed"}'
+```
 
 ## Tests (local Python)
 
