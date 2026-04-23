@@ -55,17 +55,12 @@ def configure_telemetry() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    configure_telemetry()
     meter = metrics.get_meter(__name__)
     app.state.work_counter = meter.create_counter(
         "sample_service.work_requests",
         unit="1",
         description="Count of /work requests",
     )
-    if not _otel_disabled():
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-        FastAPIInstrumentor.instrument_app(app)
     yield
 
 
@@ -86,3 +81,10 @@ async def work(request: Request) -> dict[str, str]:
         time.sleep(0.05)
         logger.info("finished fake work")
     return {"status": "done"}
+
+
+configure_telemetry()
+if not _otel_disabled():
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    FastAPIInstrumentor.instrument_app(app)
