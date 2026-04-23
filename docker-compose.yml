@@ -1,0 +1,28 @@
+services:
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.25.0
+    container_name: otel-lgtm
+    ports:
+      - "3000:3000"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - otel-lgtm-data:/data
+
+  sample-service:
+    build:
+      context: ./apps/sample-service
+      dockerfile: Dockerfile
+    container_name: aiops-sample-service
+    ports:
+      - "8000:8000"
+    environment:
+      OTEL_SERVICE_NAME: aiops-sample-service
+      OTEL_RESOURCE_ATTRIBUTES: service.version=0.1.0,deployment.environment=local
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-lgtm:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    depends_on:
+      - otel-lgtm
+
+volumes:
+  otel-lgtm-data:
