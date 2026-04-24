@@ -2,10 +2,11 @@
 
 `ai-ops` is a small local lab for building and testing alert-driven incident workflows on top of an OpenTelemetry stack.
 
-The repo currently includes two phases:
+The repo currently includes three phases:
 
 - **Phase 1:** a local LGTM stack plus a FastAPI sample service that emits traces, metrics, and logs over OTLP.
 - **Phase 2:** an `incident-api` service that accepts alerts, creates a simple incident record, writes an evidence artifact, and waits for a human approve or reject decision.
+- **Phase 3:** a background execution worker that processes approved incidents, records timeline events, and retries failed actions before marking terminal failure.
 
 ## What is running
 
@@ -55,6 +56,7 @@ The first startup can take a little longer while `otel-lgtm` initializes. If eit
 - `http://localhost:3000` - Grafana (`admin` / `admin`)
 - `http://localhost:8000/healthz` - sample-service health check
 - `http://localhost:8000/work` - sample-service demo work endpoint
+- `http://localhost:8001/healthz` - incident-api health check
 - `http://localhost:8001/v1/alerts` - incident intake endpoint
 - `http://localhost:8001/v1/incidents/{incident_id}` - fetch incident state
 - `http://localhost:8001/v1/incidents/{incident_id}/decision` - approve or reject an incident
@@ -92,6 +94,10 @@ Typical flow:
 2. Fetch the incident record and evidence summary
 3. Approve or reject it as a human reviewer
 
+Alert dedupe:
+
+- If an incident is still active (`pending_approval`, `approved`, or `executing`) for the same `fingerprint`, repeated alerts return the existing incident instead of creating duplicates.
+
 Example:
 
 ```bash
@@ -105,6 +111,38 @@ curl -s -X POST http://localhost:8001/v1/incidents/<incident_id>/decision \
   -H "Content-Type: application/json" \
   -d '{"decision":"approve","actor":"human@local","reason":"confirmed"}'
 ```
+
+## Phase 3 execution model
+
+Approved incidents are executed by a background worker inside `incident-api`.
+
+State progression:
+
+```text
+pending_approval -> approved -> executing -> done
+                           \-> executing -> approved (retry) -> executing ...
+                           \-> executing -> failed
+pending_approval -> rejected
+```
+
+Execution behavior:
+
+- Worker polls for `approved` incidents and claims one at a time.
+- Every transition is written to incident history (`history` array in API response).
+- On failed execution, the worker retries until `maxExecutionAttempts` is reached.
+- Terminal statuses are `done`, `rejected`, or `failed`.
+
+Operational environment variables:
+
+- `INCIDENT_WORKER_INTERVAL_SECONDS` (default `1.0`)
+- `INCIDENT_ACTION_FAIL_ON_SEVERITY` (optional comma-separated severity list for deterministic failure simulation in local testing)
+
+The `GET /v1/incidents/{incident_id}` response now includes:
+
+- `executionAttempts`
+- `maxExecutionAttempts`
+- `lastError`
+- `history` (ordered timeline of state and decision events)
 
 ## Telemetry configuration
 

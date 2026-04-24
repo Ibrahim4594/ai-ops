@@ -1,6 +1,22 @@
+import os
+import time
+
 from fastapi.testclient import TestClient
 
 from app.main import app
+
+
+def _wait_for_status(client: TestClient, incident_id: str, status: str, timeout_seconds: float = 3.0) -> dict:
+    deadline = time.time() + timeout_seconds
+    last = None
+    while time.time() < deadline:
+        response = client.get(f"/v1/incidents/{incident_id}")
+        assert response.status_code == 200
+        last = response.json()
+        if last["status"] == status:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"incident {incident_id} did not reach status={status}; last={last}")
 
 
 def test_create_incident_from_alert() -> None:
@@ -21,15 +37,18 @@ def test_create_incident_from_alert() -> None:
     assert body["status"] == "pending_approval"
     assert body["incidentId"].startswith("inc_")
     assert body["summary"]["severity"] == "warning"
+    assert body["executionAttempts"] == 0
+    assert body["maxExecutionAttempts"] == 3
+    assert body["history"][0]["eventType"] == "incident_created"
 
 
-def test_fetch_and_decide_incident() -> None:
+def test_approve_runs_execution_to_done() -> None:
     payload = {
         "source": "alertmanager",
         "fingerprint": "latency-service-a",
         "status": "firing",
         "startsAt": "2026-04-23T12:05:00Z",
-        "labels": {"alertname": "HighLatency", "service": "aiops-sample-service", "severity": "critical"},
+        "labels": {"alertname": "HighLatency", "service": "aiops-sample-service", "severity": "warning"},
         "annotations": {"summary": "p95 latency high"},
     }
 
@@ -37,20 +56,27 @@ def test_fetch_and_decide_incident() -> None:
         created = client.post("/v1/alerts", json=payload).json()
         incident_id = created["incidentId"]
 
-        get_resp = client.get(f"/v1/incidents/{incident_id}")
-        assert get_resp.status_code == 200
-        assert get_resp.json()["incidentId"] == incident_id
+        fetched = client.get(f"/v1/incidents/{incident_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["incidentId"] == incident_id
 
         decision = client.post(
             f"/v1/incidents/{incident_id}/decision",
             json={"decision": "approve", "actor": "human@local", "reason": "confirmed impact"},
         )
+        assert decision.status_code == 200
 
-    assert decision.status_code == 200
-    assert decision.json()["status"] == "approved"
+        done = _wait_for_status(client, incident_id, "done")
+
+    assert done["executionAttempts"] == 0
+    assert done["lastError"] is None
+    history_types = [entry["eventType"] for entry in done["history"]]
+    assert "decision_recorded" in history_types
+    assert "execution_started" in history_types
+    assert "execution_succeeded" in history_types
 
 
-def test_reject_invalid_decision_value() -> None:
+def test_reject_keeps_incident_out_of_execution() -> None:
     payload = {
         "source": "alertmanager",
         "fingerprint": "err-rate-service-a",
@@ -64,9 +90,55 @@ def test_reject_invalid_decision_value() -> None:
         created = client.post("/v1/alerts", json=payload).json()
         incident_id = created["incidentId"]
 
-        bad = client.post(
+        decision = client.post(
             f"/v1/incidents/{incident_id}/decision",
-            json={"decision": "later", "actor": "human@local", "reason": "invalid"},
+            json={"decision": "reject", "actor": "human@local", "reason": "false positive"},
         )
+        assert decision.status_code == 200
 
-    assert bad.status_code == 422
+        time.sleep(0.2)
+        fetched = client.get(f"/v1/incidents/{incident_id}")
+
+    assert fetched.status_code == 200
+    body = fetched.json()
+    assert body["status"] == "rejected"
+    history_types = [entry["eventType"] for entry in body["history"]]
+    assert "execution_started" not in history_types
+
+
+def test_execution_failure_retries_then_fails() -> None:
+    payload = {
+        "source": "alertmanager",
+        "fingerprint": "critical-will-fail",
+        "status": "firing",
+        "startsAt": "2026-04-23T12:15:00Z",
+        "labels": {"alertname": "CoreSystemDown", "service": "aiops-sample-service", "severity": "critical"},
+        "annotations": {"summary": "action should fail"},
+    }
+
+    previous = os.environ.get("INCIDENT_ACTION_FAIL_ON_SEVERITY")
+    os.environ["INCIDENT_ACTION_FAIL_ON_SEVERITY"] = "critical"
+    try:
+        with TestClient(app) as client:
+            created = client.post("/v1/alerts", json=payload).json()
+            incident_id = created["incidentId"]
+
+            approved = client.post(
+                f"/v1/incidents/{incident_id}/decision",
+                json={"decision": "approve", "actor": "human@local", "reason": "start execution"},
+            )
+            assert approved.status_code == 200
+
+            failed = _wait_for_status(client, incident_id, "failed")
+    finally:
+        if previous is None:
+            os.environ.pop("INCIDENT_ACTION_FAIL_ON_SEVERITY", None)
+        else:
+            os.environ["INCIDENT_ACTION_FAIL_ON_SEVERITY"] = previous
+
+    assert failed["executionAttempts"] == failed["maxExecutionAttempts"]
+    assert failed["lastError"] is not None
+    history_types = [entry["eventType"] for entry in failed["history"]]
+    assert history_types.count("execution_started") >= 1
+    assert "execution_retry_scheduled" in history_types
+    assert history_types[-1] == "execution_failed"

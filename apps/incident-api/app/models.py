@@ -5,6 +5,16 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+IncidentStatus = Literal[
+    "pending_approval",
+    "approved",
+    "rejected",
+    "executing",
+    "done",
+    "failed",
+]
+
+
 class AlertPayload(BaseModel):
     source: str
     fingerprint: str
@@ -27,8 +37,20 @@ class IncidentSummary(BaseModel):
     next_best_action: str
 
 
+class IncidentEvent(BaseModel):
+    eventType: str
+    fromStatus: IncidentStatus | None = None
+    toStatus: IncidentStatus | None = None
+    message: str
+    at: str
+
+
 class IncidentResponse(BaseModel):
     incidentId: str
-    status: str
+    status: IncidentStatus
     summary: IncidentSummary
     evidenceArtifactPath: str
+    executionAttempts: int
+    maxExecutionAttempts: int
+    lastError: str | None = None
+    history: list[IncidentEvent] = Field(default_factory=list)

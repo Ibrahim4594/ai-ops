@@ -10,8 +10,9 @@ from fastapi import FastAPI, HTTPException
 from opentelemetry import metrics, trace
 
 from .evidence import write_evidence
-from .models import AlertPayload, DecisionRequest, IncidentResponse, IncidentSummary
+from .models import AlertPayload, DecisionRequest, IncidentEvent, IncidentResponse, IncidentSummary
 from .store import IncidentStore
+from .worker import ExecutionActionRunner, IncidentExecutionWorker
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +81,16 @@ def new_incident_id() -> str:
 async def lifespan(app: FastAPI):
     db_path = os.getenv("INCIDENT_DB_PATH", "/data/incidents.db")
     artifact_dir = os.getenv("INCIDENT_ARTIFACT_DIR", "/data/artifacts")
+    worker_interval_seconds = float(os.getenv("INCIDENT_WORKER_INTERVAL_SECONDS", "1.0"))
 
     app.state.store = IncidentStore(db_path)
     app.state.artifact_dir = artifact_dir
+    app.state.worker = IncidentExecutionWorker(
+        store=app.state.store,
+        interval_seconds=worker_interval_seconds,
+        runner=ExecutionActionRunner.from_env(),
+    )
+    app.state.worker.start()
 
     meter = metrics.get_meter(__name__)
     app.state.alert_counter = meter.create_counter(
@@ -96,6 +104,7 @@ async def lifespan(app: FastAPI):
         description="Count of incident decision submissions",
     )
     yield
+    app.state.worker.stop()
 
 
 app = FastAPI(title="aiops-incident-api", lifespan=lifespan)
@@ -106,12 +115,31 @@ if not _otel_disabled():
     FastAPIInstrumentor.instrument_app(app)
 
 
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 def _to_incident_response(incident: dict) -> IncidentResponse:
+    history = [
+        IncidentEvent(
+            eventType=entry["event_type"],
+            fromStatus=entry["from_status"],
+            toStatus=entry["to_status"],
+            message=entry["message"],
+            at=entry["created_at"],
+        )
+        for entry in app.state.store.list_events(incident["id"])
+    ]
     return IncidentResponse(
         incidentId=incident["id"],
         status=incident["status"],
         summary=IncidentSummary(**json.loads(incident["summary_json"])),
         evidenceArtifactPath=incident["artifact_path"],
+        executionAttempts=incident["execution_attempts"],
+        maxExecutionAttempts=incident["max_execution_attempts"],
+        lastError=incident["last_error"],
+        history=history,
     )
 
 
