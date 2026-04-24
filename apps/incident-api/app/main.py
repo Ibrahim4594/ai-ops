@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from opentelemetry import metrics, trace
@@ -85,6 +87,9 @@ async def lifespan(app: FastAPI):
 
     app.state.store = IncidentStore(db_path)
     app.state.artifact_dir = artifact_dir
+    recovered = app.state.store.recover_stuck_executions()
+    if recovered:
+        logger.warning("Recovered %s incident(s) stuck in executing", recovered)
     app.state.worker = IncidentExecutionWorker(
         store=app.state.store,
         interval_seconds=worker_interval_seconds,
@@ -161,12 +166,22 @@ async def create_alert(payload: AlertPayload) -> IncidentResponse:
         payload.model_dump(),
         summary.model_dump(),
     )
-    incident = store.create_incident(
-        incident_id=incident_id,
-        fingerprint=payload.fingerprint,
-        summary=summary.model_dump(),
-        artifact_path=artifact_path,
-    )
+    try:
+        incident = store.create_incident(
+            incident_id=incident_id,
+            fingerprint=payload.fingerprint,
+            summary=summary.model_dump(),
+            artifact_path=artifact_path,
+        )
+    except sqlite3.IntegrityError:
+        try:
+            Path(artifact_path).unlink(missing_ok=True)
+        except OSError:
+            logger.exception("failed to clean orphan evidence file %s", artifact_path)
+        existing = store.get_open_by_fingerprint(payload.fingerprint)
+        if existing:
+            return _to_incident_response(existing)
+        raise
     return _to_incident_response(incident)
 
 

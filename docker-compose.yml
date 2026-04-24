@@ -38,6 +38,7 @@ services:
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       INCIDENT_DB_PATH: /data/incidents.db
       INCIDENT_ARTIFACT_DIR: /data/artifacts
+      INCIDENT_WORKER_INTERVAL_SECONDS: 1.0
     volumes:
       - incident-data:/data
     depends_on:

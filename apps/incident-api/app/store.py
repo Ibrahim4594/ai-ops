@@ -191,18 +191,21 @@ class IncidentStore:
     def set_decision(self, incident_id: str, decision: str, actor: str, reason: str) -> dict:
         now = utc_now()
         next_status = "approved" if decision == "approve" else "rejected"
-        with self._tx() as conn:
-            updated = conn.execute(
+        with self._tx(immediate=True) as conn:
+            row = conn.execute("SELECT status FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+            if row is None:
+                raise KeyError(incident_id)
+            if row["status"] != "pending_approval":
+                raise ValueError("incident is not pending approval")
+
+            conn.execute(
                 """
                 UPDATE incidents
                 SET status = ?, updated_at = ?
-                WHERE id = ? AND status = 'pending_approval'
+                WHERE id = ?
                 """,
                 (next_status, now, incident_id),
             )
-            if updated.rowcount != 1:
-                raise ValueError("incident is not pending approval")
-
             conn.execute(
                 "INSERT INTO decisions (incident_id, decision, actor, reason, decided_at) VALUES (?, ?, ?, ?, ?)",
                 (incident_id, decision, actor, reason, now),
@@ -323,6 +326,59 @@ class IncidentStore:
                 message=message,
             )
         return self.get_incident(incident_id)
+
+    def recover_stuck_executions(self) -> int:
+        recovered = 0
+        with self._tx(immediate=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, execution_attempts, max_execution_attempts
+                FROM incidents
+                WHERE status = 'executing'
+                """
+            ).fetchall()
+
+            now = utc_now()
+            for row in rows:
+                incident_id = row["id"]
+                attempts = int(row["execution_attempts"])
+                max_attempts = int(row["max_execution_attempts"])
+                if attempts < max_attempts:
+                    conn.execute(
+                        """
+                        UPDATE incidents
+                        SET status = 'approved', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, incident_id),
+                    )
+                    self._insert_event(
+                        conn,
+                        incident_id=incident_id,
+                        event_type="execution_recovered",
+                        from_status="executing",
+                        to_status="approved",
+                        message="Recovered incident stuck in executing after process restart.",
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE incidents
+                        SET status = 'failed', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, incident_id),
+                    )
+                    self._insert_event(
+                        conn,
+                        incident_id=incident_id,
+                        event_type="execution_failed",
+                        from_status="executing",
+                        to_status="failed",
+                        message="Recovered incident had no retries left and was marked failed.",
+                    )
+                recovered += 1
+        return recovered
 
     def _insert_event(
         self,

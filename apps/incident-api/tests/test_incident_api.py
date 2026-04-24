@@ -42,6 +42,25 @@ def test_create_incident_from_alert() -> None:
     assert body["history"][0]["eventType"] == "incident_created"
 
 
+def test_duplicate_alert_while_active_returns_same_incident() -> None:
+    payload = {
+        "source": "alertmanager",
+        "fingerprint": "duplicate-fingerprint-a",
+        "status": "firing",
+        "startsAt": "2026-04-23T12:01:00Z",
+        "labels": {"alertname": "HighCPU", "service": "aiops-sample-service", "severity": "warning"},
+        "annotations": {"summary": "CPU over threshold"},
+    }
+
+    with TestClient(app) as client:
+        first = client.post("/v1/alerts", json=payload)
+        second = client.post("/v1/alerts", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["incidentId"] == first.json()["incidentId"]
+
+
 def test_approve_runs_execution_to_done() -> None:
     payload = {
         "source": "alertmanager",
@@ -142,3 +161,47 @@ def test_execution_failure_retries_then_fails() -> None:
     assert history_types.count("execution_started") >= 1
     assert "execution_retry_scheduled" in history_types
     assert history_types[-1] == "execution_failed"
+
+
+def test_decision_unknown_incident_returns_404() -> None:
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/incidents/inc_does_not_exist/decision",
+            json={"decision": "approve", "actor": "human@local", "reason": "n/a"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "incident not found"
+
+
+def test_recover_stuck_executing_incident() -> None:
+    payload = {
+        "source": "alertmanager",
+        "fingerprint": "recover-stuck-executing",
+        "status": "firing",
+        "startsAt": "2026-04-23T12:20:00Z",
+        "labels": {"alertname": "HighCPU", "service": "aiops-sample-service", "severity": "warning"},
+        "annotations": {"summary": "simulate crash recovery"},
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/v1/alerts", json=payload).json()
+        incident_id = created["incidentId"]
+
+        # Force a stuck state as if the process crashed mid-execution.
+        with app.state.store._tx(immediate=True) as conn:  # noqa: SLF001 - explicit test hook
+            conn.execute(
+                "UPDATE incidents SET status = 'executing' WHERE id = ?",
+                (incident_id,),
+            )
+
+        recovered = app.state.store.recover_stuck_executions()
+        assert recovered == 1
+
+        fetched = client.get(f"/v1/incidents/{incident_id}")
+
+    assert fetched.status_code == 200
+    body = fetched.json()
+    assert body["status"] == "approved"
+    history_types = [entry["eventType"] for entry in body["history"]]
+    assert "execution_recovered" in history_types
